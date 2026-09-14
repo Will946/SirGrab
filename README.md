@@ -55,6 +55,8 @@ hinges bend in one plane, the 2nd hinge bends in the perpendicular plane,
 and the grip rotation twists around the claw's own pointing direction,
 like a screwdriver bit, rather than around the arm's main axis.
 
+![Arm 3D Control interface](ArmControlUI.png)
+
 Dragging a slider doesn't jump the arm straight to the new position.
 Every joint has a target, wherever the slider currently is, and a current
 value, what's actually been sent so far. A smoothing loop nudges the
