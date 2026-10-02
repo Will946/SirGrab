@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Arm Gamepad Control</title>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 24px; background: #f4f4f4; }
+  h2 { margin-top: 0; }
+  #status { padding: 10px; margin-bottom: 20px; border-radius: 4px; font-size: 14px; }
+  .connected { background: #d4edda; color: #155724; }
+  .disconnected { background: #f8d7da; color: #721c24; }
+  table { border-collapse: collapse; width: 100%; max-width: 600px; }
+  td, th { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+  th { background: #e8e8e8; }
+  .bar-bg { background: #ddd; border-radius: 4px; height: 14px; width: 200px; position: relative; }
+  .bar-fill { background: #4a86e8; border-radius: 4px; height: 100%; }
+  #controls-help { margin-top: 24px; font-size: 13px; color: #555; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<h2>Arm Gamepad Control</h2>
+<div id="status" class="disconnected">No gamepad detected - press any button to connect</div>
+<div id="ws-status" class="disconnected">Connecting to bridge...</div>
+<div id="debug" style="font-size: 12px; color: #888; margin-bottom: 16px;">Raw pads array length: -</div>
+<button id="reset-btn" style="padding: 10px 20px; background: #ffdddd; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-bottom: 10px;">Reset to calibration</button>
+<br>
+<button id="calibrate-btn" style="padding: 10px 20px; background: #ddeeff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-bottom: 10px;">Calibrate sticks</button>
+<div id="calibrate-status" style="font-size: 13px; color: #555; margin-bottom: 20px;">Not calibrated yet - using raw center. Let go of both sticks and click Calibrate sticks.</div>
+
+<table>
+  <tr><th>Control</th><th>Channel(s)</th><th>Value</th><th></th></tr>
+  <tr><td>Base rotation</td><td>ch0</td><td id="val-0">90</td><td><div class="bar-bg"><div class="bar-fill" id="bar-0"></div></div></td></tr>
+  <tr><td>Bottom hinge</td><td>ch3/ch8</td><td id="val-bottom">0</td><td><div class="bar-bg"><div class="bar-fill" id="bar-bottom"></div></div></td></tr>
+  <tr><td>2nd hinge</td><td>ch7</td><td id="val-7">105</td><td><div class="bar-bg"><div class="bar-fill" id="bar-7"></div></div></td></tr>
+  <tr><td>Topmost hinge</td><td>ch4</td><td id="val-4">90</td><td><div class="bar-bg"><div class="bar-fill" id="bar-4"></div></div></td></tr>
+  <tr><td>3rd hinge</td><td>ch12</td><td id="val-12">90</td><td><div class="bar-bg"><div class="bar-fill" id="bar-12"></div></div></td></tr>
+  <tr><td>Grip rotation</td><td>ch15</td><td id="val-15">60</td><td><div class="bar-bg"><div class="bar-fill" id="bar-15"></div></div></td></tr>
+  <tr><td>Grip open/close</td><td>ch11</td><td id="val-11">90</td><td><div class="bar-bg"><div class="bar-fill" id="bar-11"></div></div></td></tr>
+</table>
+
+<div id="controls-help">
+  <strong>Controls</strong><br>
+  Left stick: base rotation (X) and bottom hinge (Y)<br>
+  Right stick: 2nd hinge, left/right (X) and 3rd hinge, up/down (Y)<br>
+  Triggers: topmost hinge - LT decreases, RT increases<br>
+  Bumpers: grip rotation - LB decreases, RB increases, hold<br>
+  Face buttons: grip - A closes, B opens, hold<br>
+  Every control is velocity-based and clamped to its safety range - holding full
+  deflection moves at a constant rate until it reaches the limit, then stops there.
+</div>
+
+<script>
+const CENTER = { 0: 90, 3: 75, 8: 105, 4: 90, 7: 105, 11: 90, 12: 90, 15: 60 };
+
+// Per-channel safety ranges, same bounds used by the 3D slider viewer
+const RANGE = {
+  0: [0, 180],
+  bottom: [-55, 55],   // offset applied to ch3/ch8
+  12: [20, 160],
+  7: [50, 160],
+  4: [20, 160],
+  15: [20, 100],
+  11: [0, 180],
+};
+
+let current = { base: 90, bottom: 0, third: 90, ch7: 105, topmost: 90, gripRotate: 60, grip: 90 };
+
+const STEP_RATE = 0.35;  // degrees per tick, ALWAYS this value whenever an input is active - lower = slower/gentler
+const DEADZONE = 0.12;  // ignore small stick drift near center
+
+// Most sticks don't rest at exactly 0 on every axis - there's often a small
+// persistent bias. If that bias sits above DEADZONE, a "pure" push on one
+// axis can still register a nonzero reading on the other. Calibration
+// measures each axis's actual resting value so we can treat THAT as zero.
+let axisOffsets = [0, 0, 0, 0];  // left X, left Y, right X, right Y
+
+// Returns -1, 0, or 1 only - NOT scaled by how far the stick is pushed.
+// Any deflection past the deadzone moves at the same fixed STEP_RATE,
+// whether it's barely past center or all the way to the edge.
+function direction(v) {
+  if (v > DEADZONE) return 1;
+  if (v < -DEADZONE) return -1;
+  return 0;
+}
+
+// Fixes cross-talk DURING a push (not a resting offset - calibration can't
+// catch this since it only measures the stick at rest). If you're pushing
+// mostly along one axis, the other axis can still leak a small signal on
+// some sticks. This compares the two axes each frame and, when one is
+// clearly dominant, zeroes out the smaller one entirely rather than letting
+// it leak through as unintended rotation. True diagonal pushes, where both
+// axes are genuinely similar in magnitude, still pass through normally.
+const DOMINANT_AXIS_RATIO = 2.5;  // how much bigger the dominant axis must be - lower = stricter
+
+function suppressCrossTalk(x, y) {
+  const ax = Math.abs(x);
+  const ay = Math.abs(y);
+  if (ax > ay * DOMINANT_AXIS_RATIO) return [x, 0];
+  if (ay > ax * DOMINANT_AXIS_RATIO) return [0, y];
+  return [x, y];
+}
+
+function calibrateSticks() {
+  const pads = navigator.getGamepads();
+  let gp = null;
+  for (let i = 0; i < pads.length; i++) {
+    if (pads[i]) { gp = pads[i]; break; }
+  }
+  if (!gp) {
+    document.getElementById("calibrate-status").textContent = "No gamepad connected - can't calibrate.";
+    return;
+  }
+
+  const samples = [[], [], [], []];
+  const durationMs = 2000;
+  const startTime = performance.now();
+
+  function sampleTick() {
+    const pads = navigator.getGamepads();
+    let gp = null;
+    for (let i = 0; i < pads.length; i++) {
+      if (pads[i]) { gp = pads[i]; break; }
+    }
+    if (gp) {
+      for (let i = 0; i < 4; i++) samples[i].push(gp.axes[i] || 0);
+    }
+
+    const elapsed = performance.now() - startTime;
+    document.getElementById("calibrate-status").textContent =
+      `Calibrating... hold still, don't touch the sticks. ${Math.ceil((durationMs - elapsed) / 1000)}s`;
+
+    if (elapsed < durationMs) {
+      requestAnimationFrame(sampleTick);
+    } else {
+      axisOffsets = samples.map(arr => arr.reduce((a, b) => a + b, 0) / (arr.length || 1));
+      document.getElementById("calibrate-status").textContent =
+        `Calibrated. Resting offsets: left X ${axisOffsets[0].toFixed(3)}, left Y ${axisOffsets[1].toFixed(3)}, ` +
+        `right X ${axisOffsets[2].toFixed(3)}, right Y ${axisOffsets[3].toFixed(3)}`;
+    }
+  }
+
+  document.getElementById("calibrate-status").textContent = "Calibrating... hold still, don't touch the sticks.";
+  requestAnimationFrame(sampleTick);
+}
+
+document.getElementById("calibrate-btn").addEventListener("click", calibrateSticks);
+
+function clamp(v, range) {
+  return Math.max(range[0], Math.min(range[1], v));
+}
+
+// ---------------- WebSocket to the local bridge ----------------
+let ws = null;
+let wsReady = false;
+function connectWS() {
+  ws = new WebSocket("ws://localhost:8765");
+  ws.onopen = () => {
+    wsReady = true;
+    document.getElementById("ws-status").textContent = "Connected to bridge";
+    document.getElementById("ws-status").className = "connected";
+  };
+  ws.onclose = () => {
+    wsReady = false;
+    document.getElementById("ws-status").textContent = "Disconnected from bridge - retrying...";
+    document.getElementById("ws-status").className = "disconnected";
+    setTimeout(connectWS, 1500);
+  };
+}
+connectWS();
+
+function sendChannel(channel, angle) {
+  if (wsReady) ws.send(JSON.stringify({ channel, angle: Math.round(angle) }));
+}
+
+// ---------------- Gamepad polling loop ----------------
+let lastSent = {};
+function maybeSend(channel, angle) {
+  const rounded = Math.round(angle);
+  if (lastSent[channel] === rounded) return;
+  lastSent[channel] = rounded;
+  sendChannel(channel, rounded);
+}
+
+function updateDisplay() {
+  document.getElementById("val-0").textContent = Math.round(current.base);
+  document.getElementById("val-bottom").textContent = Math.round(current.bottom);
+  document.getElementById("val-7").textContent = Math.round(current.ch7);
+  document.getElementById("val-4").textContent = Math.round(current.topmost);
+  document.getElementById("val-12").textContent = Math.round(current.third);
+  document.getElementById("val-15").textContent = Math.round(current.gripRotate);
+  document.getElementById("val-11").textContent = Math.round(current.grip);
+
+  const pct = (v, range) => ((v - range[0]) / (range[1] - range[0])) * 100;
+  document.getElementById("bar-0").style.width = pct(current.base, RANGE[0]) + "%";
+  document.getElementById("bar-bottom").style.width = pct(current.bottom, RANGE.bottom) + "%";
+  document.getElementById("bar-7").style.width = pct(current.ch7, RANGE[7]) + "%";
+  document.getElementById("bar-4").style.width = pct(current.topmost, RANGE[4]) + "%";
+  document.getElementById("bar-12").style.width = pct(current.third, RANGE[12]) + "%";
+  document.getElementById("bar-15").style.width = pct(current.gripRotate, RANGE[15]) + "%";
+  document.getElementById("bar-11").style.width = pct(current.grip, RANGE[11]) + "%";
+}
+
+let resetting = false;
+const resetTargets = { base: 90, bottom: 0, third: 90, ch7: 105, topmost: 90, gripRotate: 60, grip: 90 };
+
+document.getElementById("reset-btn").addEventListener("click", () => {
+  resetting = true;  // pollGamepad's loop eases toward resetTargets while this is true
+});
+
+function resetStep() {
+  let stillMoving = false;
+  for (const key in resetTargets) {
+    const diff = resetTargets[key] - current[key];
+    if (Math.abs(diff) < STEP_RATE) {
+      current[key] = resetTargets[key];
+    } else {
+      current[key] += Math.sign(diff) * STEP_RATE;
+      stillMoving = true;
+    }
+  }
+
+  const ch3 = CENTER[3] + current.bottom;
+  const ch8 = CENTER[8] - current.bottom;
+  maybeSend(0, current.base);
+  maybeSend(3, ch3);
+  maybeSend(8, ch8);
+  maybeSend(7, current.ch7);
+  maybeSend(4, current.topmost);
+  maybeSend(12, current.third);
+  maybeSend(15, current.gripRotate);
+  maybeSend(11, current.grip);
+  updateDisplay();
+
+  if (!stillMoving) resetting = false;
+}
+
+function pollGamepad() {
+  const pads = navigator.getGamepads();
+  // Don't assume slot 0 - Chrome assigns slots by connection history across
+  // your whole browser profile, so with multiple controllers ever paired,
+  // the active one can end up in slot 1, 2, etc. Find the first real one.
+  let gp = null;
+  for (let i = 0; i < pads.length; i++) {
+    if (pads[i]) { gp = pads[i]; break; }
+  }
+
+  document.getElementById("debug").textContent =
+    `Raw pads array length: ${pads.length} | Slots filled: ${Array.from(pads).map((p, i) => p ? i : null).filter(i => i !== null).join(', ') || 'none'}`;
+
+  if (resetting) {
+    resetStep();
+    requestAnimationFrame(pollGamepad);
+    return;  // skip reading gamepad input while a reset is in progress
+  }
+
+  if (gp) {
+    document.getElementById("status").textContent = `Connected: ${gp.id}`;
+    document.getElementById("status").className = "connected";
+
+    const leftRaw = suppressCrossTalk(
+      (gp.axes[0] || 0) - axisOffsets[0],
+      (gp.axes[1] || 0) - axisOffsets[1]
+    );
+    const rightRaw = suppressCrossTalk(
+      (gp.axes[2] || 0) - axisOffsets[2],
+      (gp.axes[3] || 0) - axisOffsets[3]
+    );
+
+    const lx = direction(leftRaw[0]);
+    const ly = direction(leftRaw[1]);
+    const rx = direction(rightRaw[0]);
+    const ry = direction(rightRaw[1]);
+
+    // Triggers: some browsers report these as buttons with analog .value, others as axes.
+    // Standard mapping uses buttons[6] (LT) and buttons[7] (RT).
+    // Triggers are analog too, but treated the same way - any squeeze past a
+    // small threshold counts as "pressed," not scaled by how hard
+    const ltPressed = (gp.buttons[6] ? gp.buttons[6].value : 0) > 0.1;
+    const rtPressed = (gp.buttons[7] ? gp.buttons[7].value : 0) > 0.1;
+    const triggerDir = (rtPressed ? 1 : 0) - (ltPressed ? 1 : 0);
+
+    const lb = gp.buttons[4] ? gp.buttons[4].pressed : false;
+    const rb = gp.buttons[5] ? gp.buttons[5].pressed : false;
+
+    const btnA = gp.buttons[0] ? gp.buttons[0].pressed : false;
+    const btnB = gp.buttons[1] ? gp.buttons[1].pressed : false;
+
+    current.base = clamp(current.base + lx * STEP_RATE, RANGE[0]);
+    current.bottom = clamp(current.bottom + ly * STEP_RATE, RANGE.bottom);
+    current.ch7 = clamp(current.ch7 + rx * STEP_RATE, RANGE[7]);
+    current.third = clamp(current.third + ry * STEP_RATE, RANGE[12]);
+    current.topmost = clamp(current.topmost + triggerDir * STEP_RATE, RANGE[4]);
+
+    if (lb) current.gripRotate = clamp(current.gripRotate - STEP_RATE, RANGE[15]);
+    if (rb) current.gripRotate = clamp(current.gripRotate + STEP_RATE, RANGE[15]);
+
+    if (btnA) current.grip = clamp(current.grip - STEP_RATE, RANGE[11]);
+    if (btnB) current.grip = clamp(current.grip + STEP_RATE, RANGE[11]);
+
+    const ch3 = CENTER[3] + current.bottom;
+    const ch8 = CENTER[8] - current.bottom;
+
+    maybeSend(0, current.base);
+    maybeSend(3, ch3);
+    maybeSend(8, ch8);
+    maybeSend(7, current.ch7);
+    maybeSend(4, current.topmost);
+    maybeSend(12, current.third);
+    maybeSend(15, current.gripRotate);
+    maybeSend(11, current.grip);
+
+    updateDisplay();
+  } else {
+    document.getElementById("status").textContent = "No gamepad detected - press any button to connect";
+    document.getElementById("status").className = "disconnected";
+  }
+
+  requestAnimationFrame(pollGamepad);
+}
+
+window.addEventListener("gamepadconnected", () => {
+  console.log("Gamepad connected.");
+});
+
+requestAnimationFrame(pollGamepad);
+</script>
+</body>
+</html>
