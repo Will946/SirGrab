@@ -69,6 +69,18 @@ instead of just running 0 to 180 for everything, and is capped to a
 safety window. That means it's not possible to drag a joint into a
 position closer to its mechanical limit than intended.
 
+There's a second control page, `arm_gamepad_control.html`, that connects
+to the same bridge and drives the arm with a PS5 DualSense controller
+instead of sliders. The left stick handles base rotation and the bottom
+hinge, the right stick handles the 2nd and 3rd hinge, the triggers handle
+the topmost hinge, the bumpers handle grip rotation, and the face buttons
+open and close the grip. This is velocity control, not position control.
+Holding a stick or trigger moves the joint at a constant rate for as long
+as it's held, rather than mapping stick position directly to arm
+position. Every joint still respects the same calibrated safety range as
+the sliders, so holding an input at the edge of its range just holds the
+joint there instead of continuing to push against the limit.
+
 ## Limitations of the current approach
 
 - **Control is entirely manual.** Posing the arm means dragging sliders
@@ -84,6 +96,34 @@ position closer to its mechanical limit than intended.
 - **Slider control doesn't scale well to fast or complex motion.** It's
   fine for careful positioning, but clumsy for anything that needs to
   happen quickly across multiple joints at once.
+
+## Limitations of gamepad control
+
+- **Stick drift.** Analog sticks often don't rest at exactly zero on
+  every axis, and that resting bias can be enough to register as
+  unintended input on its own. The gamepad page has a calibration button
+  that measures each axis's true resting position and uses that as zero
+  instead of assuming it's perfectly centered.
+- **Cross-talk during a push, which calibration can't fix.** Calibration
+  only measures the stick at rest. Pushing a stick in a straight line
+  along one axis can still leak a small signal into the other axis on
+  some hardware, this showed up as pushing straight down also triggering
+  a small rotation. The fix in place compares both axes on a stick each
+  frame and suppresses the smaller one whenever one axis is clearly
+  dominant, so single-axis pushes read as single-axis input. Genuine
+  diagonal pushes, where both axes are deliberately similar in magnitude,
+  still pass through normally.
+- **Calibration doesn't persist.** Stick calibration resets every time
+  the page is reloaded and has to be redone each session.
+- **Button and axis index mapping can vary between controllers and
+  browsers.** The standard layout assumed here, for example buttons 6 and
+  7 for the triggers, is common but not guaranteed. A different
+  controller or browser may need the index numbers adjusted.
+- **The Gamepad API only recognizes a controller per browser tab, and
+  only after a real button press while that tab is focused.** Pairing a
+  controller over Bluetooth, or detecting it on another page, doesn't
+  carry over automatically. Each new tab needs its own button press to
+  register the controller.
 
 ## Currently working on
 
